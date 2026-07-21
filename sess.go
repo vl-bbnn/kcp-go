@@ -839,6 +839,15 @@ func (s *UDPSession) GetSRTTVar() int32 {
 	return s.kcp.rx_rttvar
 }
 
+// WaitSnd returns the number of data segments waiting for transmission or
+// acknowledgement. A zero value means that all data accepted by Write has
+// been acknowledged by the remote KCP endpoint.
+func (s *UDPSession) WaitSnd() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.kcp.WaitSnd()
+}
+
 // SetOOBHandler registers a callback for receiving out-of-band (OOB) data.
 //
 // OOB data is delivered unreliably and bypasses the KCP reliable data path.
