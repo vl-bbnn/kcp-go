@@ -679,7 +679,9 @@ func (s *UDPSession) Control(f func(conn net.PacketConn) error) error {
 //
 // Pipeline: KCP output -> chPostProcessing -> [FEC] -> [Encrypt] -> TxQueue -> Network
 func (s *UDPSession) postProcess() {
-	txqueue := make([]ipv4.Message, 0, devBacklog)
+	// Flush batches are much smaller than the pending-output channel. Grow
+	// normally if FEC or duplication takes a batch above the flush threshold.
+	txqueue := make([]ipv4.Message, 0, maxBatchSize)
 	chDie := s.die
 
 	ctx := context.Background()
