@@ -28,14 +28,14 @@ func TestPostProcessBatchPayloadPreservation(t *testing.T) {
 	for _, dup := range []int{0, 2, 70} {
 		t.Run(strconv.Itoa(dup), func(t *testing.T) {
 			conn := new(batchMemoryPacketConn)
-			s := &UDPSession{conn: conn, remote: &net.UDPAddr{}, die: make(chan struct{}), chPostProcessing: make(chan sendRequest, devBacklog), kcp: NewKCP(1, func([]byte, int) {}), dup: dup}
+			s := &UDPSession{conn: conn, remote: &net.UDPAddr{}, die: make(chan struct{}), chPostProcessing: make(chan *sendRequest, devBacklog), kcp: NewKCP(1, func([]byte, int) {}), dup: dup}
 			expected := make([][]byte, 0)
 			for n := 0; n < 193; n++ {
 				data := defaultBufferPool.Get()[:33]
 				for i := range data {
 					data[i] = byte(n + i)
 				}
-				s.chPostProcessing <- sendRequest{buffer: data}
+				s.chPostProcessing <- acquireSendRequest(data, false)
 				for i := 0; i <= dup; i++ {
 					expected = append(expected, bytes.Clone(data))
 				}
@@ -57,7 +57,7 @@ func TestPostProcessBatchPayloadPreservation(t *testing.T) {
 // Measures the actual per-sender queue allocation independently of sockets,
 // KCP setup, traffic payloads and background scheduling.
 func BenchmarkPostProcessEmptyLifecycle(b *testing.B) {
-	s := &UDPSession{die: make(chan struct{}), chPostProcessing: make(chan sendRequest, devBacklog)}
+	s := &UDPSession{die: make(chan struct{}), chPostProcessing: make(chan *sendRequest, devBacklog)}
 	close(s.die)
 	b.ReportAllocs()
 	b.ResetTimer()

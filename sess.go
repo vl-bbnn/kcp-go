@@ -113,6 +113,41 @@ type sendRequest struct {
 	oob    bool
 }
 
+// Pool only the small envelope; payload ownership moves to the consumer.
+// Pointer channel slots preserve the full burst capacity without reserving
+// an entire sendRequest value for every idle slot in every session.
+var sendRequestPool = sync.Pool{New: func() any { return new(sendRequest) }}
+
+func acquireSendRequest(buffer []byte, oob bool) *sendRequest {
+	req := sendRequestPool.Get().(*sendRequest)
+	req.buffer, req.oob = buffer, oob
+	return req
+}
+
+func releaseSendRequest(req *sendRequest) {
+	*req = sendRequest{}
+	sendRequestPool.Put(req)
+}
+
+// enqueuePostProcessing takes ownership of buffer in every case. It must
+// remain nonblocking because KCP invokes its output callback under s.mu.
+func (s *UDPSession) enqueuePostProcessing(buffer []byte, oob bool) error {
+	req := acquireSendRequest(buffer, oob)
+	select {
+	case s.chPostProcessing <- req:
+		return nil
+	case <-s.die:
+		releaseSendRequest(req)
+		defaultBufferPool.Put(buffer)
+		return errors.WithStack(io.ErrClosedPipe)
+	default:
+		releaseSendRequest(req)
+		defaultBufferPool.Put(buffer)
+		// Reliable packets are retransmitted by KCP; OOB is best effort.
+		return nil
+	}
+}
+
 // OOB callback function
 type OOBCallBackType func([]byte)
 
@@ -158,7 +193,7 @@ type (
 		socketWriteErrorOnce sync.Once
 
 		// packets waiting to be sent on wire
-		chPostProcessing chan sendRequest
+		chPostProcessing chan *sendRequest
 
 		// platform-dependent optimizations
 		platform platform
@@ -196,7 +231,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.chWriteEvent = make(chan struct{}, 1)
 	sess.chSocketReadError = make(chan struct{})
 	sess.chSocketWriteError = make(chan struct{})
-	sess.chPostProcessing = make(chan sendRequest, devBacklog)
+	sess.chPostProcessing = make(chan *sendRequest, devBacklog)
 	sess.remote = remote
 	sess.conn = conn
 	sess.ownConn = ownConn
@@ -232,15 +267,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 			// copy the data to a new buffer, and reserve header space
 			copy(bts[sess.headerSize:], buf)
 
-			// delivery to post processing (non-blocking to avoid deadlock under lock)
-			select {
-			case sess.chPostProcessing <- sendRequest{bts, false}:
-			case <-sess.die:
-				return
-			default:
-				// drop and recycle to avoid blocking; KCP will retransmit if needed
-				defaultBufferPool.Put(bts)
-			}
+			_ = sess.enqueuePostProcessing(bts, false)
 		}
 	})
 
@@ -691,6 +718,7 @@ func (s *UDPSession) postProcess() {
 		case req := <-s.chPostProcessing: // dequeue from post processing
 			buf := req.buffer
 			oob := req.oob
+			releaseSendRequest(req)
 
 			var ecc [][]byte
 
@@ -925,21 +953,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 	// Copy OOB payload immediately after the conversation ID.
 	copy(buf[s.headerSize+convSize:], data)
 
-	// Enqueue the packet for post-processing.
-	// Performs OOB framing, encryption, and transmission, bypassing FEC and KCP.
-	select {
-	case s.chPostProcessing <- sendRequest{buf, true}:
-		return nil
-	case <-s.die:
-		// Session is closing.
-		defaultBufferPool.Put(buf)
-		return errors.WithStack(io.ErrClosedPipe)
-	default:
-		// Drop silently to avoid blocking the sender.
-		// OOB delivery is best-effort by design.
-		defaultBufferPool.Put(buf)
-		return nil
-	}
+	return s.enqueuePostProcessing(buf, true)
 }
 
 func (s *UDPSession) notifyReadEvent() {
