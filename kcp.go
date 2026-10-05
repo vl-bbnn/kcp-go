@@ -134,6 +134,21 @@ type segment struct {
 	data     []byte
 }
 
+// receiveWatermark encodes a standard WINS packet whose UNA cumulatively
+// acknowledges every contiguous segment received by this KCP instance. The
+// caller must hold the owning UDPSession.mu while taking this snapshot.
+func (kcp *KCP) receiveWatermark() []byte {
+	packet := make([]byte, IKCP_OVERHEAD)
+	seg := segment{
+		conv: kcp.conv,
+		cmd:  IKCP_CMD_WINS,
+		wnd:  kcp.wnd_unused(),
+		una:  kcp.rcv_nxt,
+	}
+	seg.encode(packet)
+	return packet
+}
+
 // encode a segment header into buffer
 func (seg *segment) encode(ptr []byte) []byte {
 	_ = ptr[IKCP_OVERHEAD-1] // BCE hint

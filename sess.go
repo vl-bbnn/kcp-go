@@ -109,8 +109,20 @@ func (timeoutError) Temporary() bool { return true }
 
 // sendRequest defines a write request before encoding and transmission
 type sendRequest struct {
-	buffer []byte
-	oob    bool
+	buffer  []byte
+	oob     bool
+	receipt *watermarkReceipt
+}
+
+// watermarkReceipt is used only by the WLT control close path. Ordinary KCP
+// output keeps its existing nonblocking queue semantics.
+type watermarkReceipt struct {
+	ctx  context.Context
+	done chan error
+}
+
+type receiptPacketConn interface {
+	WriteToReceipt(context.Context, []byte, net.Addr) error
 }
 
 // OOB callback function
@@ -234,7 +246,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 
 			// delivery to post processing (non-blocking to avoid deadlock under lock)
 			select {
-			case sess.chPostProcessing <- sendRequest{bts, false}:
+			case sess.chPostProcessing <- sendRequest{buffer: bts}:
 			case <-sess.die:
 				return
 			default:
@@ -739,6 +751,49 @@ func (s *UDPSession) postProcess() {
 				}
 			}
 
+			if req.receipt != nil {
+				// Preserve FIFO ordering with ordinary KCP output. The WINS
+				// packet bypasses the void-returning tx batch so its receipt
+				// covers the actual underlying writer.
+				if len(txqueue) > 0 {
+					s.tx(txqueue)
+					for k := range txqueue {
+						defaultBufferPool.Put(txqueue[k].Buffers[0])
+						txqueue[k].Buffers = nil
+					}
+					txqueue = txqueue[:0]
+					bytesToSend = 0
+				}
+				var err error
+				if err = req.receipt.ctx.Err(); err == nil {
+					writer, ok := s.conn.(receiptPacketConn)
+					if !ok {
+						err = errors.New("kcp: receive watermark receipt unsupported")
+					} else {
+						err = writer.WriteToReceipt(req.receipt.ctx, buf, s.remote)
+					}
+				}
+				defaultBufferPool.Put(buf)
+				if err == nil && len(ecc) > 0 {
+					parity := make([]ipv4.Message, len(ecc))
+					for k := range ecc {
+						// FEC encoder parity is backed by its reusable shard cache.
+						// Copy it just as the ordinary tx path does before handing it
+						// to the writer or returning it to the packet buffer pool.
+						copyBuf := defaultBufferPool.Get()[:len(ecc[k])]
+						copy(copyBuf, ecc[k])
+						parity[k] = ipv4.Message{Addr: s.remote, Buffers: [][]byte{copyBuf}}
+					}
+					s.tx(parity)
+					for k := range parity {
+						defaultBufferPool.Put(parity[k].Buffers[0])
+					}
+				}
+				req.receipt.done <- err
+				chDie = s.die
+				continue
+			}
+
 			// --- Stage 3: TX batching ---
 			var msg ipv4.Message
 			msg.Addr = s.remote
@@ -848,6 +903,54 @@ func (s *UDPSession) WaitSnd() int {
 	return s.kcp.WaitSnd()
 }
 
+// FlushReceiveWatermark sends a standard WINS control packet with an exact
+// snapshot of rcv_nxt. Unlike ordinary KCP output, this packet has a bounded,
+// nonlossy admission and a receipt from the underlying packet connection.
+func (s *UDPSession) FlushReceiveWatermark(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, ok := s.conn.(receiptPacketConn); !ok {
+		return errors.New("kcp: receive watermark receipt unsupported")
+	}
+	s.mu.Lock()
+	packet := s.kcp.receiveWatermark()
+	buf := defaultBufferPool.Get()[:len(packet)+s.headerSize]
+	copy(buf[s.headerSize:], packet)
+	s.mu.Unlock()
+	receipt := &watermarkReceipt{ctx: ctx, done: make(chan error, 1)}
+	select {
+	case s.chPostProcessing <- sendRequest{buffer: buf, receipt: receipt}:
+	case <-ctx.Done():
+		defaultBufferPool.Put(buf)
+		return ctx.Err()
+	case <-s.die:
+		defaultBufferPool.Put(buf)
+		return io.ErrClosedPipe
+	}
+	select {
+	case err := <-receipt.done:
+		return err
+	case <-ctx.Done():
+		select {
+		case err := <-receipt.done:
+			return err
+		default:
+		}
+		return ctx.Err()
+	case <-s.die:
+		select {
+		case err := <-receipt.done:
+			return err
+		default:
+		}
+		return io.ErrClosedPipe
+	}
+}
+
 // SetOOBHandler registers a callback for receiving out-of-band (OOB) data.
 //
 // OOB data is delivered unreliably and bypasses the KCP reliable data path.
@@ -926,7 +1029,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 	// Enqueue the packet for post-processing.
 	// Performs OOB framing, encryption, and transmission, bypassing FEC and KCP.
 	select {
-	case s.chPostProcessing <- sendRequest{buf, true}:
+	case s.chPostProcessing <- sendRequest{buffer: buf, oob: true}:
 		return nil
 	case <-s.die:
 		// Session is closing.
