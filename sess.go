@@ -109,8 +109,20 @@ func (timeoutError) Temporary() bool { return true }
 
 // sendRequest defines a write request before encoding and transmission
 type sendRequest struct {
-	buffer []byte
-	oob    bool
+	buffer  []byte
+	oob     bool
+	receipt *watermarkReceipt
+}
+
+// watermarkReceipt is used only by the WLT control close path. Ordinary KCP
+// output keeps its existing nonblocking queue semantics.
+type watermarkReceipt struct {
+	ctx  context.Context
+	done chan error
+}
+
+type receiptPacketConn interface {
+	WriteToReceipt(context.Context, []byte, net.Addr) error
 }
 
 // Pool only the small envelope; payload ownership moves to the consumer.
@@ -718,6 +730,7 @@ func (s *UDPSession) postProcess() {
 		case req := <-s.chPostProcessing: // dequeue from post processing
 			buf := req.buffer
 			oob := req.oob
+			receipt := req.receipt
 			releaseSendRequest(req)
 
 			var ecc [][]byte
@@ -767,6 +780,49 @@ func (s *UDPSession) postProcess() {
 					binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
 					block.Encrypt(ecc[k], ecc[k])
 				}
+			}
+
+			if receipt != nil {
+				// Preserve FIFO ordering with ordinary KCP output. The WINS
+				// packet bypasses the void-returning tx batch so its receipt
+				// covers the actual underlying writer.
+				if len(txqueue) > 0 {
+					s.tx(txqueue)
+					for k := range txqueue {
+						defaultBufferPool.Put(txqueue[k].Buffers[0])
+						txqueue[k].Buffers = nil
+					}
+					txqueue = txqueue[:0]
+					bytesToSend = 0
+				}
+				var err error
+				if err = receipt.ctx.Err(); err == nil {
+					writer, ok := s.conn.(receiptPacketConn)
+					if !ok {
+						err = errors.New("kcp: receive watermark receipt unsupported")
+					} else {
+						err = writer.WriteToReceipt(receipt.ctx, buf, s.remote)
+					}
+				}
+				defaultBufferPool.Put(buf)
+				if err == nil && len(ecc) > 0 {
+					parity := make([]ipv4.Message, len(ecc))
+					for k := range ecc {
+						// FEC encoder parity is backed by its reusable shard cache.
+						// Copy it just as the ordinary tx path does before handing it
+						// to the writer or returning it to the packet buffer pool.
+						copyBuf := defaultBufferPool.Get()[:len(ecc[k])]
+						copy(copyBuf, ecc[k])
+						parity[k] = ipv4.Message{Addr: s.remote, Buffers: [][]byte{copyBuf}}
+					}
+					s.tx(parity)
+					for k := range parity {
+						defaultBufferPool.Put(parity[k].Buffers[0])
+					}
+				}
+				receipt.done <- err
+				chDie = s.die
+				continue
 			}
 
 			// --- Stage 3: TX batching ---
@@ -876,6 +932,58 @@ func (s *UDPSession) WaitSnd() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.kcp.WaitSnd()
+}
+
+// FlushReceiveWatermark sends a standard WINS control packet with an exact
+// snapshot of rcv_nxt. Unlike ordinary KCP output, this packet has a bounded,
+// nonlossy admission and a receipt from the underlying packet connection.
+func (s *UDPSession) FlushReceiveWatermark(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, ok := s.conn.(receiptPacketConn); !ok {
+		return errors.New("kcp: receive watermark receipt unsupported")
+	}
+	s.mu.Lock()
+	packet := s.kcp.receiveWatermark()
+	buf := defaultBufferPool.Get()[:len(packet)+s.headerSize]
+	copy(buf[s.headerSize:], packet)
+	s.mu.Unlock()
+	receipt := &watermarkReceipt{ctx: ctx, done: make(chan error, 1)}
+	req := acquireSendRequest(buf, false)
+	req.receipt = receipt
+	select {
+	case s.chPostProcessing <- req:
+	case <-ctx.Done():
+		releaseSendRequest(req)
+		defaultBufferPool.Put(buf)
+		return ctx.Err()
+	case <-s.die:
+		releaseSendRequest(req)
+		defaultBufferPool.Put(buf)
+		return io.ErrClosedPipe
+	}
+	select {
+	case err := <-receipt.done:
+		return err
+	case <-ctx.Done():
+		select {
+		case err := <-receipt.done:
+			return err
+		default:
+		}
+		return ctx.Err()
+	case <-s.die:
+		select {
+		case err := <-receipt.done:
+			return err
+		default:
+		}
+		return io.ErrClosedPipe
+	}
 }
 
 // SetOOBHandler registers a callback for receiving out-of-band (OOB) data.
