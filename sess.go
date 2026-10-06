@@ -174,8 +174,12 @@ type (
 
 		// kcp receiving is based on packets
 		// recvbuf turns packets into stream
-		recvbuf []byte
-		bufptr  []byte
+		recvbuf       []byte
+		writeSealed   bool
+		chWriteSealed chan struct{}
+		chReadEOF     chan struct{}
+		readEOF       atomic.Bool
+		bufptr        []byte
 
 		// FEC codec
 		fecDecoder *fecDecoder
@@ -239,6 +243,8 @@ type (
 func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, ownConn bool, remote net.Addr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
 	sess.die = make(chan struct{})
+	sess.chWriteSealed = make(chan struct{})
+	sess.chReadEOF = make(chan struct{})
 	sess.chReadEvent = make(chan struct{}, 1)
 	sess.chWriteEvent = make(chan struct{}, 1)
 	sess.chSocketReadError = make(chan struct{})
@@ -373,11 +379,17 @@ RESET_TIMER:
 			return n, nil
 		}
 
+		if s.readEOF.Load() {
+			s.mu.Unlock()
+			return 0, io.EOF
+		}
 		s.mu.Unlock()
 
 		// if it runs here, that means we have to block the call, and wait until the
 		// next data packet arrives.
 		select {
+		case <-s.chReadEOF:
+			continue
 		case <-s.chReadEvent:
 			if timeout != nil {
 				if !timeout.Stop() {
@@ -433,6 +445,10 @@ RESET_TIMER:
 		}
 
 		s.mu.Lock()
+		if s.writeSealed {
+			s.mu.Unlock()
+			return 0, errors.WithStack(net.ErrClosed)
+		}
 
 		// make sure write do not overflow the max sliding window on both side
 		waitsnd := s.kcp.WaitSnd()
@@ -469,6 +485,8 @@ RESET_TIMER:
 		// if it runs here, that means we have to block the call, and wait until the
 		// transmit buffer to become available again.
 		select {
+		case <-s.chWriteSealed:
+			return 0, errors.WithStack(net.ErrClosed)
 		case <-s.chWriteEvent:
 			if timeout != nil {
 				if !timeout.Stop() {
