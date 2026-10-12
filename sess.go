@@ -145,6 +145,13 @@ func releaseSendRequest(req *sendRequest) {
 // remain nonblocking because KCP invokes its output callback under s.mu.
 func (s *UDPSession) enqueuePostProcessing(buffer []byte, oob bool) error {
 	req := acquireSendRequest(buffer, oob)
+	s.postProcessingAdmission.Lock()
+	defer s.postProcessingAdmission.Unlock()
+	if s.postProcessingSealed {
+		releaseSendRequest(req)
+		defaultBufferPool.Put(buffer)
+		return errors.WithStack(io.ErrClosedPipe)
+	}
 	select {
 	case s.chPostProcessing <- req:
 		return nil
@@ -211,6 +218,12 @@ type (
 		// packets waiting to be sent on wire
 		chPostProcessing chan *sendRequest
 
+		// Admission and final worker exit share this short lock. No network
+		// operation, cancellation wait, or full-queue wait holds it.
+		postProcessingAdmission   sync.Mutex
+		postProcessingSealed      bool
+		chPostProcessingAvailable chan struct{}
+
 		// platform-dependent optimizations
 		platform platform
 
@@ -250,6 +263,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.chSocketReadError = make(chan struct{})
 	sess.chSocketWriteError = make(chan struct{})
 	sess.chPostProcessing = make(chan *sendRequest, devBacklog)
+	sess.chPostProcessingAvailable = make(chan struct{}, 1)
 	sess.remote = remote
 	sess.conn = conn
 	sess.ownConn = ownConn
@@ -746,6 +760,10 @@ func (s *UDPSession) postProcess() {
 	for {
 		select {
 		case req := <-s.chPostProcessing: // dequeue from post processing
+			select {
+			case s.chPostProcessingAvailable <- struct{}{}:
+			default:
+			}
 			buf := req.buffer
 			oob := req.oob
 			receipt := req.receipt
@@ -893,10 +911,14 @@ func (s *UDPSession) postProcess() {
 
 		case <-chDie:
 			// remaining packets in txqueue should be sent out
+			s.postProcessingAdmission.Lock()
 			if len(s.chPostProcessing) > 0 {
+				s.postProcessingAdmission.Unlock()
 				chDie = nil // block chDie temporarily
 				continue
 			}
+			s.postProcessingSealed = true
+			s.postProcessingAdmission.Unlock()
 			return
 		}
 	}
@@ -973,16 +995,40 @@ func (s *UDPSession) FlushReceiveWatermark(ctx context.Context) error {
 	receipt := &watermarkReceipt{ctx: ctx, done: make(chan error, 1)}
 	req := acquireSendRequest(buf, false)
 	req.receipt = receipt
-	select {
-	case s.chPostProcessing <- req:
-	case <-ctx.Done():
+	// A canceled/retired producer retains its buffer until admission. Once
+	// queued, only the live postprocessor owns and releases that buffer.
+	discard := func(err error) error {
 		releaseSendRequest(req)
 		defaultBufferPool.Put(buf)
-		return ctx.Err()
-	case <-s.die:
-		releaseSendRequest(req)
-		defaultBufferPool.Put(buf)
-		return io.ErrClosedPipe
+		return err
+	}
+	for {
+		s.postProcessingAdmission.Lock()
+		if err := ctx.Err(); err != nil {
+			s.postProcessingAdmission.Unlock()
+			return discard(err)
+		}
+		if s.postProcessingSealed || s.isClosed() {
+			s.postProcessingAdmission.Unlock()
+			return discard(io.ErrClosedPipe)
+		}
+		admitted := false
+		select {
+		case s.chPostProcessing <- req:
+			admitted = true
+		default:
+		}
+		s.postProcessingAdmission.Unlock()
+		if admitted {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return discard(ctx.Err())
+		case <-s.die:
+			return discard(io.ErrClosedPipe)
+		case <-s.chPostProcessingAvailable:
+		}
 	}
 	select {
 	case err := <-receipt.done:
