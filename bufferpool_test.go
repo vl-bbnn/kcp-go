@@ -1,6 +1,9 @@
 package kcp
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 func TestBufferPoolGetSize(t *testing.T) {
 	bp := newBufferPool(mtuLimit)
@@ -20,28 +23,50 @@ func TestBufferPoolGetSize(t *testing.T) {
 	}
 }
 
+// sync.Pool.Get may return a new buffer: Go also deliberately drops a
+// fraction of Put values under race instrumentation. Validate safe borrowing
+// and preserved bytes when reuse actually occurs, without demanding identity.
 func TestBufferPoolPutAndReuse(t *testing.T) {
 	bp := newBufferPool(mtuLimit)
-
 	buf := bp.Get()
-	// Modify buffer to track it
 	buf[0] = 99
-
-	// Put back to pool
-	bp.Put(buf)
-
-	// Get again; it should reuse the same buffer
-	buf2 := bp.Get()
-
-	// Check if it is reused by comparing pointer address
-	if &buf2[0] != &buf[0] {
-		t.Fatalf("expected buffer reuse, but got a new one")
-		return
+	if err := bp.Put(buf[:1]); err != nil {
+		t.Fatal(err)
 	}
-
-	if buf2[0] != 99 {
-		t.Fatalf("expected reused buffer to keep previous data")
-		return
+	next := bp.Get()
+	if len(next) != mtuLimit || cap(next) != mtuLimit {
+		t.Fatalf("returned buffer shape len=%d cap=%d", len(next), cap(next))
+	}
+	if &next[0] == &buf[0] && next[0] != 99 {
+		t.Fatal("reused buffer data changed")
+	}
+}
+func TestBufferPoolAfterGCStillReturnsUsableFullBuffer(t *testing.T) {
+	bp := newBufferPool(mtuLimit)
+	buf := bp.Get()
+	buf[0] = 99
+	if err := bp.Put(buf[:1]); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	runtime.GC()
+	next := bp.Get()
+	if len(next) != mtuLimit || cap(next) != mtuLimit {
+		t.Fatalf("buffer after allowed eviction len=%d cap=%d", len(next), cap(next))
+	}
+	next[mtuLimit-1] = 42
+}
+func TestBufferPoolOutstandingBorrowersDoNotAlias(t *testing.T) {
+	bp := newBufferPool(mtuLimit)
+	first := bp.Get()
+	second := bp.Get()
+	if &first[0] == &second[0] {
+		t.Fatal("two outstanding borrowers share writable storage")
+	}
+	first[0] = 99
+	second[0] = 42
+	if first[0] != 99 {
+		t.Fatal("second borrower changed first owned bytes")
 	}
 }
 
