@@ -202,6 +202,7 @@ type (
 		dup        int          // duplicate udp packets(testing purpose)
 
 		// notifications
+		workers      *sessionWorkerLifetime
 		die          chan struct{} // notify current session has Closed
 		dieOnce      sync.Once
 		chReadEvent  chan struct{} // notify Read() can be called without blocking
@@ -256,6 +257,7 @@ type (
 func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, ownConn bool, remote net.Addr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
 	sess.die = make(chan struct{})
+	sess.workers = newSessionWorkerLifetime(l == nil)
 	sess.chWriteSealed = make(chan struct{})
 	sess.chReadEOF = make(chan struct{})
 	sess.chReadEvent = make(chan struct{}, 1)
@@ -309,17 +311,17 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	}
 
 	// create post-processing goroutine
-	go sess.postProcess()
+	go sess.runPostWorker()
 
 	if sess.l == nil { // it's a client connection
-		go sess.readLoop()
+		go sess.runReadWorker()
 		atomic.AddUint64(&DefaultSnmp.ActiveOpens, 1)
 	} else {
 		atomic.AddUint64(&DefaultSnmp.PassiveOpens, 1)
 	}
 
 	// start per-session updater
-	SystemTimedSched.Put(sess.update, time.Now())
+	sess.scheduleUpdate(time.Now())
 
 	currestab := atomic.AddUint64(&DefaultSnmp.CurrEstab, 1)
 	maxconn := atomic.LoadUint64(&DefaultSnmp.MaxConn)
@@ -937,7 +939,7 @@ func (s *UDPSession) update() {
 		}
 		s.mu.Unlock()
 		// self-synchronized timed scheduling
-		SystemTimedSched.Put(s.update, time.Now().Add(time.Duration(interval)*time.Millisecond))
+		s.scheduleUpdate(time.Now().Add(time.Duration(interval) * time.Millisecond))
 	}
 }
 
