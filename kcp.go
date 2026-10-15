@@ -245,6 +245,9 @@ type KCP struct {
 	nocwnd     int32  // 1 = disable congestion control
 	stream     int32  // 1 = stream mode (no message boundaries), 0 = message mode
 
+	// Per-session scheduled PUSH accounting; guarded by the session mutex.
+	transmitStats TransmitStats
+
 	// Logging
 	logmask KCPLogType
 
@@ -910,10 +913,14 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				continue
 			}
 			if segment.xmit == 0 { // initial transmit
+				kcp.transmitStats.InitialSegments++
+				kcp.transmitStats.InitialPayloadBytes += uint64(len(segment.data))
 				needsend = true
 				segment.rto = kcp.rx_rto
 				segment.resendts = current + segment.rto
 			} else if segment.fastack >= resent && segment.fastack != 0xFFFFFFFF { // fast retransmit
+				kcp.transmitStats.FastSegments++
+				kcp.transmitStats.FastPayloadBytes += uint64(len(segment.data))
 				needsend = true
 				segment.fastack = 0xFFFFFFFF // must wait until RTO to reset
 				segment.rto = kcp.rx_rto
@@ -921,6 +928,8 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				change++
 				fastRetransSegs++
 			} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 { // early retransmit
+				kcp.transmitStats.EarlySegments++
+				kcp.transmitStats.EarlyPayloadBytes += uint64(len(segment.data))
 				needsend = true
 				segment.fastack = 0xFFFFFFFF
 				segment.rto = kcp.rx_rto
@@ -928,6 +937,8 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				change++
 				earlyRetransSegs++
 			} else if _itimediff(current, segment.resendts) >= 0 { // RTO
+				kcp.transmitStats.TimeoutSegments++
+				kcp.transmitStats.TimeoutPayloadBytes += uint64(len(segment.data))
 				needsend = true
 				if kcp.nodelay == 0 {
 					segment.rto += kcp.rx_rto
