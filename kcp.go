@@ -240,10 +240,11 @@ type KCP struct {
 	updated  uint32 // whether Update() has been called at least once
 
 	// Reliability
-	dead_link  uint32 // max retransmit count before link is considered dead
-	fastresend int32  // fast retransmit trigger count, 0 = disabled
-	nocwnd     int32  // 1 = disable congestion control
-	stream     int32  // 1 = stream mode (no message boundaries), 0 = message mode
+	dead_link                      uint32 // max retransmit count before link is considered dead
+	fastresend                     int32  // fast retransmit trigger count, 0 = disabled
+	ackTriggeredRetransmitDisabled bool   // opt-in per-session; RTO, ACK processing and defaults unchanged
+	nocwnd                         int32  // 1 = disable congestion control
+	stream                         int32  // 1 = stream mode (no message boundaries), 0 = message mode
 
 	// Per-session scheduled PUSH accounting; guarded by the session mutex.
 	transmitStats TransmitStats
@@ -918,7 +919,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				needsend = true
 				segment.rto = kcp.rx_rto
 				segment.resendts = current + segment.rto
-			} else if segment.fastack >= resent && segment.fastack != 0xFFFFFFFF { // fast retransmit
+			} else if !kcp.ackTriggeredRetransmitDisabled && segment.fastack >= resent && segment.fastack != 0xFFFFFFFF { // fast retransmit
 				kcp.transmitStats.FastSegments++
 				kcp.transmitStats.FastPayloadBytes += uint64(len(segment.data))
 				needsend = true
@@ -927,7 +928,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				segment.resendts = current + segment.rto
 				change++
 				fastRetransSegs++
-			} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 { // early retransmit
+			} else if !kcp.ackTriggeredRetransmitDisabled && segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 { // early retransmit
 				kcp.transmitStats.EarlySegments++
 				kcp.transmitStats.EarlyPayloadBytes += uint64(len(segment.data))
 				needsend = true
