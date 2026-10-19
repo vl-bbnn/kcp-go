@@ -355,13 +355,13 @@ RESET_TIMER:
 	if trd, ok := s.rd.Load().(time.Time); ok && !trd.IsZero() {
 		if timeout == nil {
 			timeout = time.NewTimer(time.Until(trd))
-			c = timeout.C
 			defer timeout.Stop()
 		} else {
 			// Pre-Go 1.23: Reset does not drain the channel;
 			// callers must drain at the goto-site before arriving here.
 			timeout.Reset(time.Until(trd))
 		}
+		c = timeout.C
 	} else if timeout != nil {
 		timeout.Stop()
 		c = nil // disable timeout select case
@@ -434,8 +434,8 @@ RESET_TIMER:
 					default:
 					}
 				}
-				goto RESET_TIMER
 			}
+			goto RESET_TIMER
 		case <-c:
 			return 0, errors.WithStack(errTimeout)
 		case <-s.chSocketReadError:
@@ -458,13 +458,13 @@ RESET_TIMER:
 	if twd, ok := s.wd.Load().(time.Time); ok && !twd.IsZero() {
 		if timeout == nil {
 			timeout = time.NewTimer(time.Until(twd))
-			c = timeout.C
 			defer timeout.Stop()
 		} else {
 			// Pre-Go 1.23: Reset does not drain the channel;
 			// callers must drain at the goto-site before arriving here.
 			timeout.Reset(time.Until(twd))
 		}
+		c = timeout.C
 	} else if timeout != nil {
 		timeout.Stop()
 		c = nil // disable timeout select case
@@ -531,8 +531,8 @@ RESET_TIMER:
 					default:
 					}
 				}
-				goto RESET_TIMER
 			}
+			goto RESET_TIMER
 		case <-c:
 			return 0, errors.WithStack(errTimeout)
 		case <-s.chSocketWriteError:
