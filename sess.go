@@ -188,6 +188,10 @@ type (
 		readEOF       atomic.Bool
 		bufptr        []byte
 
+		// Optional receive-ownership handoff; protected by mu.
+		applicationReads     *applicationReadHandoff
+		readOwnershipStarted bool
+
 		// FEC codec
 		fecDecoder *fecDecoder
 		fecEncoder *fecEncoder
@@ -334,6 +338,15 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 
 // Read implements net.Conn
 func (s *UDPSession) Read(b []byte) (n int, err error) {
+	g, admissionErr := s.beginApplicationRead()
+	if admissionErr != nil {
+		return 0, admissionErr
+	}
+	var applicationStop <-chan struct{}
+	if g != nil {
+		applicationStop = g.stop
+		defer s.finishApplicationRead(g)
+	}
 	var timeout *time.Timer
 	var c <-chan time.Time
 
@@ -356,6 +369,11 @@ RESET_TIMER:
 
 	for {
 		s.mu.Lock()
+		if g != nil && g.sealed {
+			err := s.retiredApplicationReadErrorLocked(g)
+			s.mu.Unlock()
+			return 0, err
+		}
 		// bufptr points to the current position of recvbuf,
 		// if previous 'b' is insufficient to accommodate the data, the
 		// remaining data will be stored in bufptr for next read.
@@ -404,6 +422,8 @@ RESET_TIMER:
 		// if it runs here, that means we have to block the call, and wait until the
 		// next data packet arrives.
 		select {
+		case <-applicationStop:
+			continue
 		case <-s.chReadEOF:
 			continue
 		case <-s.chReadEvent:

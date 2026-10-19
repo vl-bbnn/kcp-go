@@ -26,11 +26,41 @@ func (s *UDPSession) ReadRetirementContext(ctx context.Context, b []byte) (int, 
 	if _, ok := ctx.Deadline(); !ok {
 		return 0, errUnboundedRetirementRead
 	}
+	var boundScope context.Context
+	var boundDone <-chan struct{}
+	s.mu.Lock()
+	s.readOwnershipStarted = true
+	g := s.applicationReads
+	if g != nil && (!g.sealed || g.active != 0) {
+		s.mu.Unlock()
+		return 0, errReadHandoffNotJoined
+	}
+	if g != nil {
+		deadline, _ := ctx.Deadline()
+		if !deadline.Equal(g.deadline) {
+			s.mu.Unlock()
+			return 0, errReadHandoffScope
+		}
+		boundScope = g.scope
+		boundDone = boundScope.Done()
+	}
+	s.mu.Unlock()
 	for {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
+		if boundScope != nil {
+			if err := boundScope.Err(); err != nil {
+				return 0, err
+			}
+		}
 		s.mu.Lock()
+		if boundScope != nil {
+			if err := boundScope.Err(); err != nil {
+				s.mu.Unlock()
+				return 0, err
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			s.mu.Unlock()
 			return 0, err
@@ -66,6 +96,8 @@ func (s *UDPSession) ReadRetirementContext(ctx context.Context, b []byte) (int, 
 		}
 		s.mu.Unlock()
 		select {
+		case <-boundDone:
+			return 0, boundScope.Err()
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		case <-s.chReadEOF:
