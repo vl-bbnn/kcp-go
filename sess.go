@@ -144,10 +144,14 @@ type (
 		dup        int          // duplicate udp packets(testing purpose)
 
 		// notifications
-		die          chan struct{} // notify current session has Closed
-		dieOnce      sync.Once
-		chReadEvent  chan struct{} // notify Read() can be called without blocking
-		chWriteEvent chan struct{} // notify Write() can be called without blocking
+		die                 chan struct{} // notify current session has Closed
+		dieOnce             sync.Once
+		nativeWork          *ownedWork
+		nativeCloseReturned chan struct{}
+		nativeCloseError    error
+		nativeReadOwned     bool
+		chReadEvent         chan struct{} // notify Read() can be called without blocking
+		chWriteEvent        chan struct{} // notify Write() can be called without blocking
 
 		// socket error handling
 		socketReadError      atomic.Value
@@ -192,6 +196,9 @@ type (
 func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, ownConn bool, remote net.Addr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
 	sess.die = make(chan struct{})
+	sess.nativeWork = newOwnedWork("kcp-session")
+	sess.nativeCloseReturned = make(chan struct{})
+	sess.nativeReadOwned = l == nil
 	sess.chReadEvent = make(chan struct{}, 1)
 	sess.chWriteEvent = make(chan struct{}, 1)
 	sess.chSocketReadError = make(chan struct{})
@@ -250,17 +257,19 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	}
 
 	// create post-processing goroutine
-	go sess.postProcess()
+	postEnds, _ := sess.nativeWork.acquire("kcp-post-process")
+	go func() { defer postEnds[0](); sess.postProcess() }()
 
 	if sess.l == nil { // it's a client connection
-		go sess.readLoop()
+		readEnds, _ := sess.nativeWork.acquire("kcp-client-read")
+		go func() { defer readEnds[0](); sess.readLoop() }()
 		atomic.AddUint64(&DefaultSnmp.ActiveOpens, 1)
 	} else {
 		atomic.AddUint64(&DefaultSnmp.PassiveOpens, 1)
 	}
 
 	// start per-session updater
-	SystemTimedSched.Put(sess.update, time.Now())
+	sess.scheduleOwnedUpdate(time.Now())
 
 	currestab := atomic.AddUint64(&DefaultSnmp.CurrEstab, 1)
 	maxconn := atomic.LoadUint64(&DefaultSnmp.MaxConn)
@@ -463,6 +472,7 @@ func (s *UDPSession) isClosed() bool {
 func (s *UDPSession) Close() error {
 	var once bool
 	s.dieOnce.Do(func() {
+		s.nativeWork.seal()
 		close(s.die)
 		once = true
 	})
@@ -470,6 +480,7 @@ func (s *UDPSession) Close() error {
 	if !once {
 		return errors.WithStack(io.ErrClosedPipe)
 	}
+	defer close(s.nativeCloseReturned)
 
 	atomic.AddUint64(&DefaultSnmp.CurrEstab, ^uint64(0))
 
@@ -484,7 +495,8 @@ func (s *UDPSession) Close() error {
 	}
 
 	if s.ownConn { // client socket close
-		return s.conn.Close()
+		s.nativeCloseError = s.conn.Close()
+		return s.nativeCloseError
 	}
 
 	return nil
@@ -811,7 +823,7 @@ func (s *UDPSession) update() {
 		}
 		s.mu.Unlock()
 		// self-synchronized timed scheduling
-		SystemTimedSched.Put(s.update, time.Now().Add(time.Duration(interval)*time.Millisecond))
+		s.scheduleOwnedUpdate(time.Now().Add(time.Duration(interval) * time.Millisecond))
 	}
 }
 
